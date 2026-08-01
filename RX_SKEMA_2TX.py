@@ -1,34 +1,3 @@
-"""
-rx_abp_ppg.py — SISI RX SAJA (berdiri sendiri, tidak butuh proses TX)
-======================================================================
-Skema:
-  RX (PORT_RX) : ESP32 terima ABP + PPG sekaligus, dibedakan header TYPE.
-
-  Script ini BERDIRI SENDIRI — jalan di proses/komputer terpisah dari
-  tx_abp_ppg.py. Format paket dari radio TIDAK berubah (firmware Arduino
-  TIDAK perlu diubah):
-
-    ABP: START|TYPE:ABP|ABP:<raw>|SBP:<sbp>|DBP:<dbp>|SEQ:<seq>|END
-    PPG: START|TYPE:PPG|PPG:<raw>|SEQ:<seq>|END
-
-  Karena tidak ada koneksi memori bersama ke proses TX, RX menyimpulkan
-  sendiri:
-    1) Segmen & label yang sedang aktif -> dari SEQ:
-         segmen_ke = SEQ // PAKET_PER_SEGMEN  (lalu di-index ke SEGMENTS)
-    2) Nilai sinyal asli (untuk hitung SNR & error TX-RX) -> RX ikut
-       memuat file .npy yang SAMA (ABP_FILE/PPG_FILE) dan mengambil
-       sample yang tepat sesuai SEQ. Ini malah lebih akurat daripada
-       korelasi silang, karena pemetaan SEQ -> sample sudah pasti.
-
-  SYARAT: FS, SEGMENTS, PAKET_PER_SEGMEN, ABP_FILE, PPG_FILE di sini
-  HARUS SAMA PERSIS dengan yang dipakai tx_abp_ppg.py.
-
-  Output:
-    hasil_rx/rx_abp.csv
-    hasil_rx/rx_ppg.csv
-    hasil_rx/ringkasan_rx.csv
-"""
-
 import serial
 import threading
 import time
