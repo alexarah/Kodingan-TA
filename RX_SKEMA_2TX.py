@@ -1,20 +1,32 @@
 """
-tdm_rx.py — TDM RX-ONLY (ABP + PPG) + HR + SNR + BP + LOSS/SUCCESS RATIO
-Bagian RX dari tdm_4panel_metrics_final_oneshot.py (dipisah dari TX).
+rx_abp_ppg.py — SISI RX SAJA (berdiri sendiri, tidak butuh proses TX)
+======================================================================
+Skema:
+  RX (PORT_RX) : ESP32 terima ABP + PPG sekaligus, dibedakan header TYPE.
 
-CATATAN PENTING (akibat pisah jadi 2 proses/laptop):
-- SNR ABP & PPG dihitung dari SINYAL REFERENSI LOKAL (dimuat ulang dari
-  p000188_abp.npy & p000188_ppg.npy di laptop RX ini), dicocokkan lewat
-  nomor SEQ — bukan lagi baca buffer TX langsung. Syaratnya: file .npy,
-  SEGMENTS, SEGMENT_DURATION, FS di sini HARUS identik dengan tdm_tx.py.
-- Segmen & mode aktif (ABP/PPG) dihitung SENDIRI oleh RX dari nomor SEQ,
-  bukan dari field khusus di paket (karena protokolnya memang tidak
-  membawa info itu).
-- Loss & Success Ratio dihitung berbasis TOTAL_TARGET (angka pasti dari
-  konfigurasi), bukan dari stats['tx_pkt'] proses TX yang sudah terpisah.
-- SBP/DBP/MAP sekarang dihitung dari sinyal yang BENAR-BENAR diterima RX
-  (buf_rx_abp), bukan dari buffer sisi TX seperti versi gabungan asli —
-  jadi sekarang ikut mencerminkan efek packet loss & noise transmisi.
+  Script ini BERDIRI SENDIRI — jalan di proses/komputer terpisah dari
+  tx_abp_ppg.py. Format paket dari radio TIDAK berubah (firmware Arduino
+  TIDAK perlu diubah):
+
+    ABP: START|TYPE:ABP|ABP:<raw>|SBP:<sbp>|DBP:<dbp>|SEQ:<seq>|END
+    PPG: START|TYPE:PPG|PPG:<raw>|SEQ:<seq>|END
+
+  Karena tidak ada koneksi memori bersama ke proses TX, RX menyimpulkan
+  sendiri:
+    1) Segmen & label yang sedang aktif -> dari SEQ:
+         segmen_ke = SEQ // PAKET_PER_SEGMEN  (lalu di-index ke SEGMENTS)
+    2) Nilai sinyal asli (untuk hitung SNR & error TX-RX) -> RX ikut
+       memuat file .npy yang SAMA (ABP_FILE/PPG_FILE) dan mengambil
+       sample yang tepat sesuai SEQ. Ini malah lebih akurat daripada
+       korelasi silang, karena pemetaan SEQ -> sample sudah pasti.
+
+  SYARAT: FS, SEGMENTS, PAKET_PER_SEGMEN, ABP_FILE, PPG_FILE di sini
+  HARUS SAMA PERSIS dengan yang dipakai tx_abp_ppg.py.
+
+  Output:
+    hasil_rx/rx_abp.csv
+    hasil_rx/rx_ppg.csv
+    hasil_rx/ringkasan_rx.csv
 """
 
 import serial
@@ -28,93 +40,62 @@ import matplotlib.gridspec as gridspec
 import matplotlib.animation as animation
 from scipy.signal import find_peaks
 from collections import deque
-from datetime import datetime
 
-# ─── KONFIGURASI (harus SAMA dengan tdm_tx.py, kecuali PORT) ──
-PORT_RX = 'COM14'
-BAUD_RATE = 115200
-FS = 125
-WINDOW_S = 5
-SEGMENT_DURATION = 15
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ABP_NPY_PATH = os.path.join(SCRIPT_DIR, 'p000188_abp.npy')
-PPG_NPY_PATH = os.path.join(SCRIPT_DIR, 'p000188_ppg.npy')
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'hasil_TDM')
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ─── KONFIGURASI (WAJIB SAMA DENGAN tx_abp_ppg.py: FS, SEGMENTS, PAKET_PER_SEGMEN) ─
+PORT_RX        = 'COM14'
+BAUD_RATE      = 115200
+FS             = 125
+WINDOW_S       = 10
+ABP_FILE       = 'p000188_abp.npy'
+PPG_FILE       = 'p000188_ppg.npy'
 
 SEGMENTS = [
-    {'idx': 0, 'label': 'Normal'},
+    {'idx': 0,  'label': 'Normal'},
     {'idx': 20, 'label': 'BP Tinggi'},
     {'idx': 25, 'label': 'BP Rendah'},
 ]
-# ──────────────────────────────────────────────────────────────
 
-HR_MIN = 40
-HR_MAX = 160
-WINDOW_N = WINDOW_S * FS
-HR_WINDOW = 60
+PAKET_PER_SEGMEN = 3750          # HARUS SAMA dengan tx_abp_ppg.py
+
+OUTPUT_DIR     = 'hasil_rx'
+
+PEAK_DIST_ABP  = 40
+PEAK_PROM_ABP  = 3
+PEAK_DIST_PPG  = 40
+PEAK_PROM_PPG  = 0.1
 
 THROUGHPUT_WIN_S = 3
-IDLE_TIMEOUT_S = 6.0     # auto-berhenti kalau tidak ada paket masuk selama ini
-SNR_WINDOW_N = 625       # jumlah sampel terakhir (per channel) buat SNR bergerak
+SNR_WIN_S        = 5
 
-TARGET_N = int(SEGMENT_DURATION * FS)          # 1.875 paket / mode / segmen
-TOTAL_TARGET = TARGET_N * 2 * len(SEGMENTS)     # total paket keseluruhan (11.250)
-
-# ─── SETUP FILE CSV (RX ABP & RX PPG) ─────────────────────────
-TIMESTAMP_RUN = datetime.now().strftime('%Y%m%d_%H%M%S')
-CSV_RX_ABP_FILENAME = os.path.join(OUTPUT_DIR, f"rx_abp_{TIMESTAMP_RUN}.csv")
-CSV_RX_PPG_FILENAME = os.path.join(OUTPUT_DIR, f"rx_ppg_{TIMESTAMP_RUN}.csv")
-RINGKASAN_FILENAME  = os.path.join(OUTPUT_DIR, f"ringkasan_RX_{TIMESTAMP_RUN}.csv")
-
-CSV_HEADER = ['timestamp', 'seq', 'segmen_idx', 'segmen_label', 'raw', 'mmhg']
-
-csv_file_rx_abp = open(CSV_RX_ABP_FILENAME, mode='w', newline='', encoding='utf-8')
-csv_writer_rx_abp = csv.writer(csv_file_rx_abp)
-csv_writer_rx_abp.writerow(CSV_HEADER)
-
-csv_file_rx_ppg = open(CSV_RX_PPG_FILENAME, mode='w', newline='', encoding='utf-8')
-csv_writer_rx_ppg = csv.writer(csv_file_rx_ppg)
-csv_writer_rx_ppg.writerow(CSV_HEADER)
-
-csv_lock = threading.Lock()
+# Berhenti otomatis kalau tidak ada data sama sekali selama sekian detik
+# (setelah minimal 1 paket pernah diterima). Tutup jendela dashboard juga bisa.
+IDLE_STOP_S = 30.0
 # ─────────────────────────────────────────────────────────────
+
+WINDOW_N = WINDOW_S * FS
+TOTAL_EXPECTED_PER_SIGNAL = PAKET_PER_SEGMEN * len(SEGMENTS)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 buf_rx_abp = deque([0.0] * WINDOW_N, maxlen=WINDOW_N)
 buf_rx_ppg = deque([0.0] * WINDOW_N, maxlen=WINDOW_N)
 
-hr_abp_hist = deque([0.0] * HR_WINDOW, maxlen=HR_WINDOW)
-hr_ppg_hist = deque([0.0] * HR_WINDOW, maxlen=HR_WINDOW)
+rx_rows_abp = []
+rx_rows_ppg = []
+lock        = threading.Lock()
+stop_evt    = threading.Event()
 
-snr_expected_abp = deque(maxlen=SNR_WINDOW_N)
-snr_actual_abp   = deque(maxlen=SNR_WINDOW_N)
-snr_expected_ppg = deque(maxlen=SNR_WINDOW_N)
-snr_actual_ppg   = deque(maxlen=SNR_WINDOW_N)
+stats_common = {'segmen': 0, 'segmen_label': '', 'channel_aktif': '-'}
 
-lock = threading.Lock()
-stop_evt = threading.Event()
-start_time = time.time()
-
-stats = {
-    'mode': 'ABP',
-    'segmen': 0,
-    'segmen_label': 'Normal',
-    'rx_pkt': 0,
-    'loss_pkt': 0,
-    'loss_pct': 0.0,
-    'success_ratio': 0.0,
-    'hr_abp': 0.0,
-    'hr_ppg': 0.0,
-    'sbp': 0.0,
-    'dbp': 0.0,
-    'map': 0.0,
-    'snr_abp_db': 0.0,
-    'snr_ppg_db': 0.0,
-    'bytes_rx': 0,
-    'thr_kbps': 0.0,
-    'pkt_rate': 0.0,
-    'selesai': False,
+stats_abp = {
+    'rx_pkt': 0, 'loss_pkt': 0, 'loss_pct': 0.0,
+    'snr_db': 0.0, 'sbp_tx': 0.0, 'dbp_tx': 0.0,
+    'sbp_rx': 0.0, 'dbp_rx': 0.0, 'map_rx': 0.0, 'pp_rx': 0.0,
+    'bytes_rx': 0, 'thr_rx_bps': 0.0, 'thr_rx_kbps': 0.0, 'pkt_rate_rx': 0.0,
+}
+stats_ppg = {
+    'rx_pkt': 0, 'loss_pkt': 0, 'loss_pct': 0.0,
+    'snr_db': 0.0, 'hr_rx': 0.0,
+    'bytes_rx': 0, 'thr_rx_bps': 0.0, 'thr_rx_kbps': 0.0, 'pkt_rate_rx': 0.0,
 }
 
 
@@ -122,7 +103,7 @@ class ThroughputMeter:
     def __init__(self, window_s=THROUGHPUT_WIN_S):
         self.window_s = window_s
         self._samples = deque()
-        self._lock = threading.Lock()
+        self._lock    = threading.Lock()
 
     def update(self, n_bytes, n_pkts=1):
         now = time.perf_counter()
@@ -145,398 +126,573 @@ class ThroughputMeter:
             return (total_b * 8) / elapsed, total_p / elapsed
 
 
-meter = ThroughputMeter()
+meter_rx_abp = ThroughputMeter()
+meter_rx_ppg = ThroughputMeter()
 
 
-# ─── FUNGSI ──────────────────────────────────────────────────
-def load_abp(seg_idx):
-    data = np.load(ABP_NPY_PATH)
-    seg = data[seg_idx].astype(float)
-    return np.tile(seg, 100)
+class ABPDetector:
+    def __init__(self, fs=FS, win_s=5):
+        self.fs = fs
+        self.buf = deque(maxlen=win_s * fs)
+        self.sbp = self.dbp = self.map_ = self.pp = 0.0
+        self.n = 0
 
-def load_ppg(seg_idx):
-    data = np.load(PPG_NPY_PATH, allow_pickle=True)
+    def update(self, val):
+        self.buf.append(val)
+        self.n += 1
+        if self.n % (self.fs // 2) != 0 or len(self.buf) < PEAK_DIST_ABP * 2:
+            return self.sbp, self.dbp, self.map_, self.pp
+        arr = np.array(self.buf)
+        peaks,   _ = find_peaks( arr, distance=PEAK_DIST_ABP, prominence=PEAK_PROM_ABP)
+        valleys, _ = find_peaks(-arr, distance=PEAK_DIST_ABP, prominence=PEAK_PROM_ABP)
+        if len(peaks)   > 0: self.sbp = float(arr[peaks].mean())
+        if len(valleys) > 0: self.dbp = float(arr[valleys].mean())
+        if self.sbp > 0 and self.dbp > 0:
+            self.pp = self.sbp - self.dbp
+            self.map_ = self.dbp + self.pp / 3.0
+        return self.sbp, self.dbp, self.map_, self.pp
+
+
+class HRDetector:
+    def __init__(self, fs=FS, win_s=5):
+        self.fs = fs
+        self.buf = deque(maxlen=win_s * fs)
+        self.hr = 0.0
+        self.n = 0
+
+    def update(self, val):
+        self.buf.append(val)
+        self.n += 1
+        if self.n % (self.fs // 2) != 0 or len(self.buf) < PEAK_DIST_PPG * 2:
+            return self.hr
+        arr = np.array(self.buf)
+        peaks, _ = find_peaks(arr, distance=PEAK_DIST_PPG, prominence=PEAK_PROM_PPG)
+        if len(peaks) >= 2:
+            self.hr = 60.0 / (np.diff(peaks) / self.fs).mean()
+        return self.hr
+
+
+# ─── Muat sinyal asli utuh, untuk rekonstruksi nilai TX dari SEQ ──
+def _load_full(filepath, label):
+    data = np.load(filepath, allow_pickle=True)
     if data.ndim == 1:
         data = data.reshape(1, -1)
-    seg = data[seg_idx].astype(float) if data.shape[0] > seg_idx else data.flatten().astype(float)
-    return np.tile(seg, 100)
+    return data
 
-def bangun_referensi():
-    """Bangun array referensi (panjang TOTAL_TARGET) yang berisi nilai
-    IDEAL untuk tiap nomor SEQ — persis mengikuti urutan pengiriman TX:
-    segmen0-ABP(1875) -> segmen0-PPG(1875) -> segmen1-ABP(1875) -> ...
-    Dipakai untuk hitung SNR & menentukan segmen/mode aktif TANPA perlu
-    akses ke proses TX."""
-    ref = np.zeros(TOTAL_TARGET, dtype=float)
-    for i, seg in enumerate(SEGMENTS):
-        base = i * 2 * TARGET_N
-        abp_sig = load_abp(seg['idx'])
-        n_abp = len(abp_sig)
-        for j in range(TARGET_N):
-            ref[base + j] = abp_sig[j % n_abp]
 
-        ppg_sig = load_ppg(seg['idx'])
-        n_ppg = len(ppg_sig)
-        for j in range(TARGET_N):
-            ref[base + TARGET_N + j] = ppg_sig[j % n_ppg]
-    return ref
+_abp_data = _load_full(ABP_FILE, 'ABP')
+_ppg_data = _load_full(PPG_FILE, 'PPG')
 
-def info_dari_seq(seq):
-    """Tentukan (segmen_idx, segmen_label, mode) HANYA dari nomor SEQ +
-    konfigurasi lokal RX. Blok ke-0..5: seg0-ABP, seg0-PPG, seg1-ABP,
-    seg1-PPG, seg2-ABP, seg2-PPG (mengikuti urutan pengiriman TX)."""
-    block = min(seq // TARGET_N, 2 * len(SEGMENTS) - 1)
-    seg_pos = block // 2
-    mode = 'ABP' if block % 2 == 0 else 'PPG'
-    seg = SEGMENTS[seg_pos]
-    return seg['idx'], seg['label'], mode
 
-def hitung_hr(buf_list, fs=FS, height=0.35, distance_s=0.35, prominence=0.2):
-    arr = np.array(buf_list, dtype=float)
-    if len(arr) < fs:
-        return 0.0
-    rng = arr.max() - arr.min()
-    if rng < 0.05:
-        return 0.0
-    arr = np.convolve(arr, np.ones(5)/5, mode='same')
-    arr_n = (arr - arr.min()) / (arr.max() - arr.min() + 1e-9)
-    peaks, _ = find_peaks(arr_n, height=height,
-                           distance=int(distance_s * fs),
-                           prominence=prominence)
-    if len(peaks) < 2:
-        return 0.0
-    rr = np.diff(peaks) / fs
-    hr = 60.0 / rr
-    hr = hr[(hr >= HR_MIN) & (hr <= HR_MAX)]
-    return float(np.median(hr)) if len(hr) > 0 else 0.0
+def segmen_dari_seq(seq):
+    seg_number = seq // PAKET_PER_SEGMEN
+    if seg_number >= len(SEGMENTS):
+        seg_number = len(SEGMENTS) - 1
+    return SEGMENTS[seg_number]
 
-def hitung_bp(buf_list):
-    arr = np.array(buf_list, dtype=float)
-    if len(arr) < 2:
-        return 0.0, 0.0, 0.0
-    sbp = float(np.percentile(arr, 95))
-    dbp = float(np.percentile(arr, 5))
-    return sbp, dbp, float(dbp + (sbp - dbp) / 3.0)
 
-def hitung_snr(expected_hist, actual_hist):
-    n = min(len(expected_hist), len(actual_hist))
-    if n < 10:
-        return 0.0
-    exp_arr = np.array(expected_hist)[-n:]
-    act_arr = np.array(actual_hist)[-n:]
-    ps = np.mean(exp_arr ** 2)
-    pn = np.mean((exp_arr - act_arr) ** 2)
-    if pn <= 1e-12:
-        return 99.0
-    return float(10 * np.log10(ps / pn))
+def nilai_asli_dari_seq(data, seq):
+    seg = segmen_dari_seq(seq)
+    i   = seq % PAKET_PER_SEGMEN
+    sig = data[seg['idx']].astype(float)
+    n   = len(sig)
+    return float(sig[i % n]), seg['idx'], seg['label']
 
-def log_csv(channel, seq, segmen_idx, segmen_label, raw, mmhg=''):
-    timestamp = time.time() - start_time
-    row = [
-        f"{timestamp:.3f}",
-        seq,
-        segmen_idx,
-        segmen_label,
-        int(raw),
-        f"{mmhg:.2f}" if mmhg != '' else ''
-    ]
-    with csv_lock:
-        if channel == 'ABP':
-            csv_writer_rx_abp.writerow(row)
-        else:
-            csv_writer_rx_ppg.writerow(row)
 
-# ─── RX THREAD ───────────────────────────────────────────────
+# ─── THREAD RX ────────────────────────────────────────────────
 def thread_rx():
     try:
-        print("[RX] Memuat sinyal referensi (untuk SNR & deteksi segmen) ...")
-        ref = bangun_referensi()
-        print(f"[RX] Referensi siap: {len(ref):,} sampel (TOTAL_TARGET = {TOTAL_TARGET:,})")
-    except Exception as e:
-        print(f"[RX] ⚠️  Gagal memuat referensi ({e}) — SNR tidak akan dihitung.")
-        ref = None
-
-    try:
         ser = serial.Serial(PORT_RX, BAUD_RATE, timeout=1)
-        time.sleep(2.0)
-        ser.reset_input_buffer()
-        print(f"[RX] OK - {PORT_RX}")
+        time.sleep(1.5)
+        print(f"[RX] Terhubung ke {PORT_RX}")
     except Exception as e:
-        print(f"[RX] ERROR: {e}")
+        print(f"[RX] ERROR: {e} — RX dinonaktifkan.")
+        stop_evt.set()
         return
 
-    serial_buf = b""
-    last_rx_time = time.time()
-    started_receiving = False
+    det_abp = ABPDetector()
+    det_ppg = HRDetector()
 
-    while not stop_evt.is_set():
-        if started_receiving and (time.time() - last_rx_time > IDLE_TIMEOUT_S):
-            print(f"\n[RX] Tidak ada data baru selama {IDLE_TIMEOUT_S:.0f} detik — anggap TX sudah selesai.")
-            with lock:
-                stats['selesai'] = True
+    snr_buf_abp = deque(maxlen=SNR_WIN_S * FS)   # (expected, received)
+    snr_buf_ppg = deque(maxlen=SNR_WIN_S * FS)
+
+    csv_abp_path = os.path.join(OUTPUT_DIR, 'rx_abp.csv')
+    f_abp = open(csv_abp_path, 'w', newline='', encoding='utf-8')
+    w_abp = csv.writer(f_abp)
+    w_abp.writerow([
+        'timestamp_s', 'segmen_idx', 'segmen_label', 'seq',
+        'abp_raw', 'abp_mmhg', 'abp_asli',
+        'sbp_rx', 'dbp_rx', 'map_rx', 'pp_rx',
+        'sbp_tx', 'dbp_tx', 'selisih_sbp', 'selisih_dbp',
+        'loss_seq_pct', 'snr_db',
+        'thr_rx_bps', 'thr_rx_kbps', 'pkt_rate_rx',
+        'valid', 'corrupt_reason'
+    ])
+
+    csv_ppg_path = os.path.join(OUTPUT_DIR, 'rx_ppg.csv')
+    f_ppg = open(csv_ppg_path, 'w', newline='', encoding='utf-8')
+    w_ppg = csv.writer(f_ppg)
+    w_ppg.writerow([
+        'timestamp_s', 'segmen_idx', 'segmen_label', 'seq',
+        'ppg_raw', 'ppg_val', 'ppg_asli', 'hr_rx',
+        'loss_seq_pct', 'snr_db',
+        'thr_rx_bps', 'thr_rx_kbps', 'pkt_rate_rx',
+        'valid', 'corrupt_reason'
+    ])
+
+    t_start      = time.time()
+    last_seq_abp = -1
+    last_seq_ppg = -1
+    buf          = b""
+    last_data_t  = time.perf_counter()
+    got_any_data = False
+
+    while True:
+        now_t = time.perf_counter()
+        if got_any_data and (now_t - last_data_t >= IDLE_STOP_S):
+            print(f"[RX] Tidak ada data selama {IDLE_STOP_S:.0f}s — dianggap selesai.")
+            break
+        if stop_evt.is_set():
             break
 
-        chunk = ser.read(ser.in_waiting or 1)
+        try:
+            chunk = ser.read(ser.in_waiting or 1)
+        except serial.SerialException as e:
+            print(f"[RX] Read error: {e}"); break
+
         if not chunk:
-            time.sleep(0.001)
-            continue
+            time.sleep(0.001); continue
 
-        serial_buf += chunk
+        got_any_data = True
+        last_data_t  = time.perf_counter()
+        buf         += chunk
 
-        while b"\n" in serial_buf:
-            line, serial_buf = serial_buf.split(b"\n", 1)
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
             line = line.strip()
-            if not line:
-                continue
+            if not line: continue
 
             try:
-                text = line.decode('utf-8', errors='replace').strip()
-                if not text.startswith('START'):
+                text = line.decode('utf-8', errors='replace')
+                if not (text.startswith('START') and 'END' in text):
                     continue
 
-                parts = {}
-                for tok in text.split('|'):
-                    if ':' in tok:
-                        k, v = tok.split(':', 1)
-                        parts[k.strip()] = v.strip()
+                fields = {}
+                for part in text.replace('START|', '').replace('|END', '').split('|'):
+                    if ':' in part:
+                        k, v = part.split(':', 1)
+                        fields[k] = v
 
-                if 'SLOT' not in parts:
-                    continue
+                pkt_type = fields.get('TYPE', '')
+                ts_s     = round(time.time() - t_start, 3)
 
-                slot = int(parts['SLOT'])
-                seq = int(parts.get('SEQ', 0))
+                # ── Paket ABP ──────────────────────────────
+                if pkt_type == 'ABP':
+                    is_valid, corrupt_reason = True, ''
 
-                last_rx_time = time.time()
-                started_receiving = True
+                    if not all(k in fields for k in ('ABP', 'SEQ')):
+                        w_abp.writerow([ts_s, '', '', ''] + [''] * 17 + [0, 'missing_field'])
+                        f_abp.flush(); continue
 
-                seg_idx, seg_label, mode_now = info_dari_seq(seq)
+                    raw        = int(fields['ABP'])
+                    seq        = int(fields['SEQ'])
+                    sbp_tx_now = float(fields.get('SBP', 0))
+                    dbp_tx_now = float(fields.get('DBP', 0))
+                    val_mm     = raw / 100.0
 
-                n_bytes_line = len(line) + 1
-                meter.update(n_bytes_line, n_pkts=1)
-                bps, pps = meter.get()
+                    seg_idx_now, seg_label_now = segmen_dari_seq(seq)['idx'], segmen_dari_seq(seq)['label']
+                    with lock:
+                        stats_common['segmen'] = seg_idx_now
+                        stats_common['segmen_label'] = seg_label_now
+                        stats_common['channel_aktif'] = 'ABP'
 
-                raw_val = None
+                    # FIX: pakai panjang baris (len(line)+1), bukan chunk_len,
+                    # dan cukup 1x update per paket -> byte count & throughput
+                    # gak lagi ke-hitung berkali-kali kalau 1 chunk read berisi
+                    # banyak paket sekaligus.
+                    meter_rx_abp.update(len(line) + 1, n_pkts=1)
+                    bps_rx, pps_rx = meter_rx_abp.get()
 
-                with lock:
-                    stats['rx_pkt'] += 1
-                    stats['bytes_rx'] += n_bytes_line
-                    stats['thr_kbps'] = bps / 1000.0
-                    stats['pkt_rate'] = pps
-                    stats['segmen'] = seg_idx
-                    stats['segmen_label'] = seg_label
-                    stats['mode'] = mode_now
+                    if not (2000 <= raw <= 25000):
+                        is_valid, corrupt_reason = False, f'abp_out_of_range({raw})'
 
-                    stats['loss_pkt'] = max(0, TOTAL_TARGET - stats['rx_pkt'])
-                    stats['loss_pct'] = (stats['loss_pkt'] / TOTAL_TARGET * 100) if TOTAL_TARGET > 0 else 0.0
-                    stats['success_ratio'] = (stats['rx_pkt'] / TOTAL_TARGET * 100) if TOTAL_TARGET > 0 else 0.0
+                    if is_valid and last_seq_abp >= 0:
+                        gap = seq - last_seq_abp - 1
+                        if 0 < gap <= 1000:
+                            with lock: stats_abp['loss_pkt'] += gap
+                    if is_valid: last_seq_abp = seq
 
-                    if slot == 0 and 'ABP' in parts:
-                        raw_val = int(parts['ABP'])
-                        val = raw_val / 100.0
-                        buf_rx_abp.append(val)
-                        if ref is not None and 0 <= seq < len(ref):
-                            snr_expected_abp.append(float(ref[seq]))
-                            snr_actual_abp.append(val)
-                            stats['snr_abp_db'] = hitung_snr(snr_expected_abp, snr_actual_abp)
-                    elif slot == 1 and 'PPG' in parts:
-                        raw_val = int(parts['PPG'])
-                        val = raw_val / 100.0
-                        buf_rx_ppg.append(val)
-                        if ref is not None and 0 <= seq < len(ref):
-                            snr_expected_ppg.append(float(ref[seq]))
-                            snr_actual_ppg.append(val)
-                            stats['snr_ppg_db'] = hitung_snr(snr_expected_ppg, snr_actual_ppg)
-                    else:
-                        val = None
+                    sbp_rx = dbp_rx = map_rx = pp_rx = 0.0
+                    sel_sbp = sel_dbp = ''
+                    asli_val = ''
 
-                    if stats['rx_pkt'] % FS == 0:
-                        if len(buf_rx_abp) >= FS:
-                            hr = hitung_hr(list(buf_rx_abp)[-FS:])
-                            stats['hr_abp'] = hr
-                            if HR_MIN <= hr <= HR_MAX:
-                                hr_abp_hist.append(hr)
-                            else:
-                                hr_abp_hist.append(hr_abp_hist[-1] if len(hr_abp_hist) > 0 else 0.0)
+                    with lock:
+                        stats_abp['rx_pkt']   += 1
+                        stats_abp['bytes_rx'] += len(line) + 1
+                        total_exp = stats_abp['rx_pkt'] + stats_abp['loss_pkt']
+                        stats_abp['loss_pct'] = (stats_abp['loss_pkt'] / total_exp * 100
+                                                  if total_exp > 0 else 0.0)
+                        stats_abp['thr_rx_bps']  = bps_rx
+                        stats_abp['thr_rx_kbps'] = bps_rx / 1000.0
+                        stats_abp['pkt_rate_rx'] = pps_rx
+                        lp_seq_snap = stats_abp['loss_pct']
 
-                            # FIX: SBP/DBP/MAP sekarang dari sinyal yang
-                            # BENAR-BENAR diterima RX (buf_rx_abp), bukan
-                            # dari buffer sisi TX seperti versi gabungan asli.
-                            sbp, dbp, mp = hitung_bp(list(buf_rx_abp)[-FS:])
-                            stats['sbp'] = sbp
-                            stats['dbp'] = dbp
-                            stats['map'] = mp
+                    if is_valid:
+                        sbp_rx, dbp_rx, map_rx, pp_rx = det_abp.update(val_mm)
 
-                        if len(buf_rx_ppg) >= FS:
-                            hr = hitung_hr(list(buf_rx_ppg)[-FS:], height=0.1, distance_s=0.4, prominence=0.1)
-                            stats['hr_ppg'] = hr
-                            if HR_MIN <= hr <= HR_MAX:
-                                hr_ppg_hist.append(hr)
-                            else:
-                                hr_ppg_hist.append(hr_ppg_hist[-1] if len(hr_ppg_hist) > 0 else 0.0)
+                        asli_val, _, _ = nilai_asli_dari_seq(_abp_data, seq)
+                        snr_buf_abp.append((asli_val, val_mm))
+                        if len(snr_buf_abp) >= FS:
+                            exp_arr = np.array([p[0] for p in snr_buf_abp])
+                            rx_arr  = np.array([p[1] for p in snr_buf_abp])
+                            exp_c   = exp_arr - exp_arr.mean()
+                            err     = exp_arr - rx_arr
+                            ps, pn  = np.mean(exp_c ** 2), np.mean(err ** 2)
+                            snr = float(np.clip(10 * np.log10(ps / pn) if pn > 1e-12 else 99.0, -10, 60))
+                            with lock: stats_abp['snr_db'] = snr
 
-                if raw_val is not None:
-                    channel = 'ABP' if slot == 0 else 'PPG'
-                    mmhg_rx = val if slot == 0 else ''
-                    log_csv(channel, seq, seg_idx, seg_label, raw_val, mmhg_rx)
+                        if sbp_rx > 0 and dbp_rx > 0:
+                            with lock:
+                                stats_abp['sbp_rx'] = sbp_rx
+                                stats_abp['dbp_rx'] = dbp_rx
+                                stats_abp['map_rx'] = map_rx
+                                stats_abp['pp_rx']  = pp_rx
+                        with lock:
+                            stats_abp['sbp_tx'] = sbp_tx_now
+                            stats_abp['dbp_tx'] = dbp_tx_now
+                            buf_rx_abp.append(val_mm)
+
+                        sel_sbp = round(sbp_rx - sbp_tx_now, 2) if sbp_rx > 0 and sbp_tx_now > 0 else ''
+                        sel_dbp = round(dbp_rx - dbp_tx_now, 2) if dbp_rx > 0 and dbp_tx_now > 0 else ''
+
+                    with lock:
+                        snr_snap = stats_abp['snr_db']
+
+                    w_abp.writerow([
+                        ts_s, seg_idx_now, seg_label_now, seq,
+                        raw, round(val_mm, 2) if is_valid else '',
+                        round(asli_val, 2) if asli_val != '' else '',
+                        round(sbp_rx, 1) if sbp_rx else '', round(dbp_rx, 1) if dbp_rx else '',
+                        round(map_rx, 1) if map_rx else '', round(pp_rx, 1) if pp_rx else '',
+                        round(sbp_tx_now, 1), round(dbp_tx_now, 1), sel_sbp, sel_dbp,
+                        round(lp_seq_snap, 2), round(snr_snap, 2),
+                        round(bps_rx, 1), round(bps_rx / 1000.0, 3), round(pps_rx, 2),
+                        1 if is_valid else 0, corrupt_reason
+                    ])
+                    f_abp.flush()
+
+                    with lock:
+                        rx_rows_abp.append({'seq': seq, 'loss_pct': lp_seq_snap,
+                                             'thr_rx_bps': bps_rx, 'pkt_rate_rx': pps_rx,
+                                             'valid': 1 if is_valid else 0, 'snr': snr_snap})
+
+                # ── Paket PPG ──────────────────────────────
+                elif pkt_type == 'PPG':
+                    is_valid, corrupt_reason = True, ''
+
+                    if not all(k in fields for k in ('PPG', 'SEQ')):
+                        w_ppg.writerow([ts_s, '', '', ''] + [''] * 10 + [0, 'missing_field'])
+                        f_ppg.flush(); continue
+
+                    raw = int(fields['PPG'])
+                    seq = int(fields['SEQ'])
+                    val = raw / 10000.0
+
+                    seg_idx_now, seg_label_now = segmen_dari_seq(seq)['idx'], segmen_dari_seq(seq)['label']
+                    with lock:
+                        stats_common['segmen'] = seg_idx_now
+                        stats_common['segmen_label'] = seg_label_now
+                        stats_common['channel_aktif'] = 'PPG'
+
+                    # FIX: sama seperti ABP — pakai panjang baris, 1x update per paket.
+                    meter_rx_ppg.update(len(line) + 1, n_pkts=1)
+                    bps_rx, pps_rx = meter_rx_ppg.get()
+
+                    if not (0 <= raw <= 40020):
+                        is_valid, corrupt_reason = False, f'ppg_out_of_range({raw})'
+
+                    if is_valid and last_seq_ppg >= 0:
+                        gap = seq - last_seq_ppg - 1
+                        if 0 < gap <= 1000:
+                            with lock: stats_ppg['loss_pkt'] += gap
+                    if is_valid: last_seq_ppg = seq
+
+                    hr_rx = 0.0
+                    asli_val = ''
+
+                    with lock:
+                        stats_ppg['rx_pkt']   += 1
+                        stats_ppg['bytes_rx'] += len(line) + 1
+                        total_exp = stats_ppg['rx_pkt'] + stats_ppg['loss_pkt']
+                        stats_ppg['loss_pct'] = (stats_ppg['loss_pkt'] / total_exp * 100
+                                                  if total_exp > 0 else 0.0)
+                        stats_ppg['thr_rx_bps']  = bps_rx
+                        stats_ppg['thr_rx_kbps'] = bps_rx / 1000.0
+                        stats_ppg['pkt_rate_rx'] = pps_rx
+                        lp_seq_snap = stats_ppg['loss_pct']
+
+                    if is_valid:
+                        hr_rx = det_ppg.update(val)
+
+                        asli_val, _, _ = nilai_asli_dari_seq(_ppg_data, seq)
+                        snr_buf_ppg.append((asli_val, val))
+                        if len(snr_buf_ppg) >= FS:
+                            exp_arr = np.array([p[0] for p in snr_buf_ppg])
+                            rx_arr  = np.array([p[1] for p in snr_buf_ppg])
+                            exp_c   = exp_arr - exp_arr.mean()
+                            err     = exp_arr - rx_arr
+                            ps, pn  = np.mean(exp_c ** 2), np.mean(err ** 2)
+                            snr = float(np.clip(10 * np.log10(ps / pn) if pn > 1e-12 else 99.0, -10, 60))
+                            with lock: stats_ppg['snr_db'] = snr
+
+                        if hr_rx > 0:
+                            with lock: stats_ppg['hr_rx'] = hr_rx
+                        with lock: buf_rx_ppg.append(val)
+
+                    with lock:
+                        snr_snap = stats_ppg['snr_db']
+
+                    w_ppg.writerow([
+                        ts_s, seg_idx_now, seg_label_now, seq,
+                        raw, round(val, 4) if is_valid else '',
+                        round(asli_val, 4) if asli_val != '' else '',
+                        round(hr_rx, 1) if hr_rx else '',
+                        round(lp_seq_snap, 2), round(snr_snap, 2),
+                        round(bps_rx, 1), round(bps_rx / 1000.0, 3), round(pps_rx, 2),
+                        1 if is_valid else 0, corrupt_reason
+                    ])
+                    f_ppg.flush()
+
+                    with lock:
+                        rx_rows_ppg.append({'seq': seq, 'loss_pct': lp_seq_snap,
+                                             'thr_rx_bps': bps_rx, 'pkt_rate_rx': pps_rx,
+                                             'valid': 1 if is_valid else 0, 'snr': snr_snap})
 
             except Exception:
                 continue
 
-    ser.close()
+    f_abp.close(); f_ppg.close(); ser.close()
+    stop_evt.set()
+    print(f"[RX] Selesai. ABP -> {csv_abp_path}  PPG -> {csv_ppg_path}")
 
-# ─── DASHBOARD ──────────────────────────────────────────────
+
+# ─── RINGKASAN ───────────────────────────────────────────────
+def cetak_ringkasan():
+    with lock:
+        rows_a = list(rx_rows_abp)
+        rows_p = list(rx_rows_ppg)
+        sa     = dict(stats_abp)
+        sp     = dict(stats_ppg)
+
+    def _ringkas(label, rows, s):
+        if not rows:
+            print(f"\n[!] Tidak ada data RX {label}."); return None
+        total          = len(rows)
+        loss_seq_avg   = np.mean([r['loss_pct'] for r in rows])
+        thr_rx = [r['thr_rx_bps']  for r in rows if r['thr_rx_bps']  > 0]
+        pps_rx = [r['pkt_rate_rx'] for r in rows if r['pkt_rate_rx'] > 0]
+        snr_avg = np.mean([r['snr'] for r in rows if r['snr'] > 0]) if any(r['snr'] > 0 for r in rows) else 0.0
+        # Rasio keberhasilan berbasis JUMLAH PAKET, dibandingkan target
+        # total paket per sinyal (asumsi TX menyelesaikan semua segmen).
+        sukses_pct = (total / TOTAL_EXPECTED_PER_SIGNAL * 100) if TOTAL_EXPECTED_PER_SIGNAL > 0 else 0.0
+
+        print(f"\n{'='*60}\n  RINGKASAN RX — {label}\n{'='*60}")
+        print(f"  Segmen              : {[sg['label'] for sg in SEGMENTS]}")
+        print(f"  Paket/segmen        : {PAKET_PER_SEGMEN:,}")
+        print(f"  Target total paket  : {TOTAL_EXPECTED_PER_SIGNAL:,}  (asumsi, dari konfigurasi)")
+        print(f"  Total paket RX      : {total:,}")
+        print(f"  Loss jaringan (SEQ) : {loss_seq_avg:.2f}%")
+        print(f"  Rasio keberhasilan  : {sukses_pct:.1f}%  ({total:,}/{TOTAL_EXPECTED_PER_SIGNAL:,} paket)")
+        print(f"  SNR rata-rata       : {snr_avg:.2f} dB")
+        if thr_rx:
+            print(f"  Throughput RX       : {np.mean(thr_rx):.1f} bps ({np.mean(thr_rx)/1000:.3f} kbps)"
+                  f" | puncak: {np.max(thr_rx):.1f} bps")
+        if pps_rx: print(f"  Laju paket RX       : {np.mean(pps_rx):.1f} pkt/s")
+        print(f"  Byte RX             : {s['bytes_rx']:,} byte")
+
+        return {'total': total, 'loss_seq_avg': loss_seq_avg, 'sukses_pct': sukses_pct,
+                'snr_avg': snr_avg, 'thr_rx': thr_rx, 'pps_rx': pps_rx, 'bytes_rx': s['bytes_rx']}
+
+    res_a = _ringkas('ABP', rows_a, sa)
+    res_p = _ringkas('PPG', rows_p, sp)
+
+    ring_path = os.path.join(OUTPUT_DIR, 'ringkasan_rx.csv')
+    with open(ring_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['sinyal', 'metrik', 'nilai'])
+        for label, res in [('ABP', res_a), ('PPG', res_p)]:
+            if res is None: continue
+            w.writerow([label, 'paket_per_segmen', PAKET_PER_SEGMEN])
+            w.writerow([label, 'target_total_paket', TOTAL_EXPECTED_PER_SIGNAL])
+            w.writerow([label, 'total_paket_rx', res['total']])
+            w.writerow([label, 'loss_jaringan_seq_pct', round(res['loss_seq_avg'], 2)])
+            w.writerow([label, 'rasio_keberhasilan_pct', round(res['sukses_pct'], 1)])
+            w.writerow([label, 'snr_db_avg', round(res['snr_avg'], 2)])
+            w.writerow([label, 'bytes_rx', res['bytes_rx']])
+            if res['thr_rx']:
+                w.writerow([label, 'thr_rx_bps_avg', round(float(np.mean(res['thr_rx'])), 1)])
+                w.writerow([label, 'thr_rx_kbps_avg', round(float(np.mean(res['thr_rx']))/1000, 3)])
+                w.writerow([label, 'thr_rx_bps_peak', round(float(np.max(res['thr_rx'])), 1)])
+            if res['pps_rx']:
+                w.writerow([label, 'pkt_rate_rx_avg', round(float(np.mean(res['pps_rx'])), 2)])
+    print(f"\n[OK] Ringkasan RX -> {ring_path}")
+    print(f"[OK] Semua file CSV di folder: {os.path.abspath(OUTPUT_DIR)}")
+
+
+# ─── DASHBOARD ───────────────────────────────────────────────
 def run_dashboard():
     plt.rcParams.update({
-        'figure.facecolor': '#0D1117',
-        'axes.facecolor': '#161B22',
-        'axes.edgecolor': '#30363D',
-        'axes.labelcolor': '#C9D1D9',
-        'xtick.color': '#8B949E',
-        'ytick.color': '#8B949E',
-        'grid.color': '#21262D',
-        'text.color': '#C9D1D9',
+        'figure.facecolor': '#0D1117', 'axes.facecolor': '#161B22',
+        'axes.edgecolor':   '#30363D', 'axes.labelcolor': '#C9D1D9',
+        'xtick.color':      '#8B949E', 'ytick.color':     '#8B949E',
+        'grid.color':       '#21262D', 'text.color':      '#C9D1D9',
+        'font.family':      'monospace', 'font.size': 10,
     })
-
-    fig = plt.figure(figsize=(12, 9))
-    gs = gridspec.GridSpec(3, 1, figure=fig, hspace=0.55,
-                           left=0.08, right=0.97, top=0.90, bottom=0.06,
-                           height_ratios=[1, 1, 1.3])
-
-    ax1 = fig.add_subplot(gs[0])
-    ax1.set_title('📥 RX ABP', color='#FF6B6B', fontsize=11, fontweight='bold', loc='left')
-    ax1.set_xlim(0, WINDOW_S)
-    ax1.set_ylim(-1.5, 1.5)
-    ax1.grid(True, alpha=0.2)
-    ax1.axhline(y=0, color='gray', lw=0.5, linestyle='--', alpha=0.5)
-    line_rx_abp, = ax1.plot([], [], 'r-', lw=2.0)
-
-    ax2 = fig.add_subplot(gs[1])
-    ax2.set_title('📥 RX PPG', color='#51CF66', fontsize=11, fontweight='bold', loc='left')
-    ax2.set_xlim(0, WINDOW_S)
-    ax2.set_ylim(-1.5, 1.5)
-    ax2.grid(True, alpha=0.2)
-    ax2.axhline(y=0, color='gray', lw=0.5, linestyle='--', alpha=0.5)
-    line_rx_ppg, = ax2.plot([], [], 'g-', lw=2.0)
-
-    ax_stats = fig.add_subplot(gs[2])
-    ax_stats.axis('off')
 
     t_axis = np.linspace(0, WINDOW_S, WINDOW_N)
 
-    mode_text = fig.text(0.5, 0.955, '📡 MENUNGGU DATA RX...', color='#FFD700', fontsize=14,
-                          fontweight='bold', ha='center', transform=fig.transFigure)
+    fig = plt.figure(figsize=(14, 9))
+    fig.suptitle(f'ABP + PPG — SISI RX\nRX: {PORT_RX}', color='#3FB950',
+                 fontsize=14, fontweight='bold', linespacing=1.6)
 
-    stats_text = ax_stats.text(0.02, 0.95, '', transform=ax_stats.transAxes,
-                                fontsize=10.5, fontfamily='monospace', color='#E3B341',
-                                verticalalignment='top',
-                                bbox=dict(boxstyle='round,pad=0.5', facecolor='#161B22', alpha=0.85))
+    gs = gridspec.GridSpec(4, 2, figure=fig, height_ratios=[0.35, 1, 1, 1.6],
+                            hspace=0.7, wspace=0.25, left=0.08, right=0.97, top=0.85, bottom=0.06)
+
+    ax_slot = fig.add_subplot(gs[0, :]); ax_slot.axis('off')
+    slot_text = ax_slot.text(0.5, 0.5, '', ha='center', va='center', transform=ax_slot.transAxes,
+                              fontsize=15, fontweight='bold')
+
+    ax_rx_abp = fig.add_subplot(gs[1, :])
+    ax_rx_ppg = fig.add_subplot(gs[2, :])
+    ax_info_abp = fig.add_subplot(gs[3, 0]); ax_info_abp.axis('off')
+    ax_info_ppg = fig.add_subplot(gs[3, 1]); ax_info_ppg.axis('off')
+
+    ax_rx_abp.set_title(f'ABP — RX ({PORT_RX})', color='#3FB950', fontsize=11, fontweight='bold', loc='left')
+    ax_rx_ppg.set_title(f'PPG — RX ({PORT_RX})', color='#56D364', fontsize=11, fontweight='bold', loc='left')
+
+    for ax in [ax_rx_abp, ax_rx_ppg]:
+        ax.set_xlim(0, WINDOW_S)
+        ax.set_xlabel('Waktu (detik)', fontsize=9)
+        ax.tick_params(labelsize=9)
+        ax.grid(True, alpha=0.3)
+    ax_rx_abp.set_ylabel('mmHg', fontsize=9)
+    ax_rx_ppg.set_ylabel('Amplitudo', fontsize=9)
+
+    line_rx_abp, = ax_rx_abp.plot(t_axis, list(buf_rx_abp), color='#3FB950', lw=1.1)
+    line_rx_ppg, = ax_rx_ppg.plot(t_axis, list(buf_rx_ppg), color='#56D364', lw=1.1)
+
+    box_style = dict(boxstyle='round,pad=0.35', facecolor='#0D1117', alpha=0.9, edgecolor='#30363D')
+    lbl_sbp = ax_rx_abp.text(0.99, 0.90, 'SBP: -- mmHg', transform=ax_rx_abp.transAxes, fontsize=10,
+                              fontweight='bold', color='#F4C275', ha='right', va='top', bbox=box_style)
+    lbl_dbp = ax_rx_abp.text(0.99, 0.66, 'DBP: -- mmHg', transform=ax_rx_abp.transAxes, fontsize=10,
+                              fontweight='bold', color='#5DCAA5', ha='right', va='top', bbox=box_style)
+    lbl_hr  = ax_rx_ppg.text(0.99, 0.90, 'HR: -- BPM', transform=ax_rx_ppg.transAxes, fontsize=10,
+                              fontweight='bold', color='#F4C275', ha='right', va='top', bbox=box_style)
+
+    info_box = dict(boxstyle='round,pad=0.5', facecolor='#161B22', alpha=0.9, edgecolor='#30363D')
+    stats_text_abp = ax_info_abp.text(0.03, 0.97, '', transform=ax_info_abp.transAxes, fontsize=10.5,
+                                       va='top', ha='left', linespacing=1.7, fontfamily='monospace',
+                                       color='#E3B341', bbox=info_box)
+    stats_text_ppg = ax_info_ppg.text(0.03, 0.97, '', transform=ax_info_ppg.transAxes, fontsize=10.5,
+                                       va='top', ha='left', linespacing=1.7, fontfamily='monospace',
+                                       color='#79C0FF', bbox=info_box)
+
+    def _fmt_abp(sa):
+        sukses = f"{sa['rx_pkt']/TOTAL_EXPECTED_PER_SIGNAL*100:5.1f}%" if TOTAL_EXPECTED_PER_SIGNAL > 0 else "  -- %"
+        return ("── ABP (RX) ─────────────────\n"
+                f"RX pkt      : {sa['rx_pkt']:>8,}\n"
+                f"Loss SEQ    : {sa['loss_pct']:>7.2f} %\n"
+                f"SBP TX/RX   : {sa['sbp_tx']:>5.1f} / {sa['sbp_rx']:<5.1f} mmHg\n"
+                f"DBP TX/RX   : {sa['dbp_tx']:>5.1f} / {sa['dbp_rx']:<5.1f} mmHg\n"
+                f"MAP / PP    : {sa['map_rx']:>5.1f} / {sa['pp_rx']:<5.1f} mmHg\n"
+                f"SNR         : {sa['snr_db']:>7.2f} dB\n"
+                f"Rasio berhasil: {sukses}\n"
+                f"Thr RX      : {sa['thr_rx_kbps']:>7.2f} kbps\n"
+                f"Rate RX     : {sa['pkt_rate_rx']:>7.1f} pkt/s\n"
+                f"Byte RX     : {sa['bytes_rx']/1024:>7.1f} KB")
+
+    def _fmt_ppg(sp):
+        sukses = f"{sp['rx_pkt']/TOTAL_EXPECTED_PER_SIGNAL*100:5.1f}%" if TOTAL_EXPECTED_PER_SIGNAL > 0 else "  -- %"
+        return ("── PPG (RX) ─────────────────\n"
+                f"RX pkt      : {sp['rx_pkt']:>8,}\n"
+                f"Loss SEQ    : {sp['loss_pct']:>7.2f} %\n"
+                f"HR RX       : {sp['hr_rx']:>7.1f} BPM\n"
+                f"SNR         : {sp['snr_db']:>7.2f} dB\n"
+                f"Rasio berhasil: {sukses}\n"
+                f"Thr RX      : {sp['thr_rx_kbps']:>7.2f} kbps\n"
+                f"Rate RX     : {sp['pkt_rate_rx']:>7.1f} pkt/s\n"
+                f"Byte RX     : {sp['bytes_rx']/1024:>7.1f} KB")
+
+    def update(_frame):
+        if stop_evt.is_set():
+            try: ani.event_source.stop()
+            except Exception: pass
+            plt.close(fig)
+            return
+
+        with lock:
+            ra = np.array(buf_rx_abp); rp = np.array(buf_rx_ppg)
+            sa = dict(stats_abp); sp = dict(stats_ppg); sc = dict(stats_common)
+
+        for line, arr, ax in [(line_rx_abp, ra, ax_rx_abp), (line_rx_ppg, rp, ax_rx_ppg)]:
+            line.set_ydata(arr)
+            rng = np.ptp(arr)
+            if rng > 0:
+                m = rng * 0.15
+                ax.set_ylim(arr.min() - m, arr.max() + m)
+
+        lbl_sbp.set_text(f"SBP: {sa['sbp_rx']:.0f} mmHg" if sa['sbp_rx'] > 0 else 'SBP: -- mmHg')
+        lbl_dbp.set_text(f"DBP: {sa['dbp_rx']:.0f} mmHg" if sa['dbp_rx'] > 0 else 'DBP: -- mmHg')
+        lbl_hr.set_text( f"HR: {sp['hr_rx']:.0f} BPM"    if sp['hr_rx']  > 0 else 'HR: -- BPM')
+
+        ch = sc.get('channel_aktif', '-')
+        slot_text.set_text(f"MENERIMA: {ch}   |   Segmen {sc.get('segmen')} ({sc.get('segmen_label')})")
+        slot_text.set_color('#FF6B6B' if ch == 'ABP' else '#51CF66')
+
+        stats_text_abp.set_text(_fmt_abp(sa))
+        stats_text_ppg.set_text(_fmt_ppg(sp))
+        fig.canvas.draw_idle()
+
+    ani = animation.FuncAnimation(fig, update, interval=150, blit=False, cache_frame_data=False)
 
     def on_close(event):
+        try: ani.event_source.stop()
+        except Exception: pass
         stop_evt.set()
 
     fig.canvas.mpl_connect('close_event', on_close)
-
-    def update(frame):
-        with lock:
-            rx_abp = np.array(buf_rx_abp, dtype=float)
-            rx_ppg = np.array(buf_rx_ppg, dtype=float)
-            s = dict(stats)
-
-        for data, line, ax in [(rx_abp, line_rx_abp, ax1), (rx_ppg, line_rx_ppg, ax2)]:
-            if len(data) == WINDOW_N:
-                line.set_data(t_axis, data)
-                rng = data.max() - data.min()
-                if rng > 0.05:
-                    margin = rng * 0.15
-                    ax.set_ylim(data.min() - margin, data.max() + margin)
-
-        if s.get('selesai'):
-            mode_text.set_text(f'✅ SELESAI — Segmen terakhir: {s["segmen"]} ({s["segmen_label"]})')
-            mode_text.set_color('#58A6FF')
-        else:
-            mode_text.set_text(f'{"🔴" if s["mode"] == "ABP" else "🟢"} MODE: {s["mode"]} — Segmen {s["segmen"]} ({s["segmen_label"]})')
-            mode_text.set_color('#FF6B6B' if s['mode'] == 'ABP' else '#51CF66')
-
-        C = "   |   "
-        stats_text.set_text(
-            f"HR ABP    : {s['hr_abp']:>6.1f} BPM{C}HR PPG    : {s['hr_ppg']:>6.1f} BPM\n"
-            f"SBP       : {s['sbp']:>6.1f} mmHg{C}DBP       : {s['dbp']:>6.1f} mmHg{C}MAP : {s['map']:>6.1f} mmHg\n"
-            f"SNR ABP   : {s['snr_abp_db']:>6.2f} dB{C}SNR PPG   : {s['snr_ppg_db']:>6.2f} dB\n"
-            f"Loss      : {s['loss_pct']:>6.2f} %{C}Success Ratio: {s['success_ratio']:>6.1f} %\n"
-            f"Throughput: {s['thr_kbps']:>6.3f} kbps{C}Laju paket: {s['pkt_rate']:>6.1f} pkt/s\n"
-            f"RX Paket  : {s['rx_pkt']:>8,} / {TOTAL_TARGET:,}{C}Loss pkt: {s['loss_pkt']:,}\n"
-            f"(Tutup jendela ini untuk berhenti & simpan CSV)"
-        )
-
-        if stop_evt.is_set():
-            ani.event_source.stop()
-            plt.close(fig)
-
-        return (line_rx_abp, line_rx_ppg, mode_text, stats_text)
-
-    ani = animation.FuncAnimation(fig, update, interval=100, blit=False)
     plt.show()
-    stop_evt.set()
 
-# ─── MAIN ────────────────────────────────────────────────────
+
 def main():
+    total_pkt = TOTAL_EXPECTED_PER_SIGNAL
     print('=' * 60)
-    print('  TDM RX-ONLY (ABP + PPG) + HR + SNR + BP + LOSS/SUCCESS')
-    print(f'  Target total paket: {TOTAL_TARGET:,}')
-    print('  Tutup jendela dashboard untuk berhenti manual')
-    print(f'  Data RX ABP akan disimpan ke: {CSV_RX_ABP_FILENAME}')
-    print(f'  Data RX PPG akan disimpan ke: {CSV_RX_PPG_FILENAME}')
+    print('  RX ABP + PPG (proses RX terpisah dari TX)')
     print('=' * 60)
+    print(f'  RX               : {PORT_RX}')
+    print(f'  Segmen           : {[s["label"] for s in SEGMENTS]}')
+    print(f'  Paket/segmen     : {PAKET_PER_SEGMEN:,}')
+    print(f'  Target total/sinyal : {total_pkt:,} paket')
+    print(f'  Idle-stop        : {IDLE_STOP_S:.0f}s tanpa data -> berhenti otomatis')
+    print(f'  Output           : {OUTPUT_DIR}/ (rx_abp.csv, rx_ppg.csv, ringkasan_rx.csv)')
+    print('=' * 60)
+    print('\nTutup jendela dashboard atau tunggu idle-stop untuk berhenti.\n')
 
-    t = threading.Thread(target=thread_rx, daemon=True)
-    t.start()
-
-    time.sleep(1)
-    run_dashboard()
-
+    t_rx = threading.Thread(target=thread_rx, daemon=True)
+    t_rx.start()
     time.sleep(0.5)
-    csv_file_rx_abp.close()
-    csv_file_rx_ppg.close()
 
-    print('\n' + '=' * 60)
-    print('  📊 RINGKASAN HASIL PENERIMAAN (RX)')
-    print('=' * 60)
-    print(f"  RX Paket total   : {stats['rx_pkt']:,} / {TOTAL_TARGET:,}")
-    print(f"  Paket hilang     : {stats['loss_pkt']:,}")
-    print(f"  Packet Loss Rate : {stats['loss_pct']:.2f} %")
-    print(f"  Success Ratio    : {stats['success_ratio']:.2f} %")
-    print(f"  Throughput       : {stats['thr_kbps']:.3f} kbps")
-    print(f"  Laju paket       : {stats['pkt_rate']:.1f} pkt/s")
-    print(f"  SNR ABP          : {stats['snr_abp_db']:.2f} dB")
-    print(f"  SNR PPG          : {stats['snr_ppg_db']:.2f} dB")
-    print(f"  HR ABP (terakhir): {stats['hr_abp']:.1f} BPM")
-    print(f"  HR PPG (terakhir): {stats['hr_ppg']:.1f} BPM")
-    print(f"  SBP/DBP/MAP      : {stats['sbp']:.1f} / {stats['dbp']:.1f} / {stats['map']:.1f} mmHg")
-    print('-' * 60)
-    print(f"  💾 Data RX ABP tersimpan di: {os.path.abspath(CSV_RX_ABP_FILENAME)}")
-    print(f"  💾 Data RX PPG tersimpan di: {os.path.abspath(CSV_RX_PPG_FILENAME)}")
-    print('=' * 60)
+    try:
+        run_dashboard()
+    except KeyboardInterrupt:
+        print('\n[Main] Dihentikan.')
+        stop_evt.set()
 
-    with open(RINGKASAN_FILENAME, 'w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
-        w.writerow(['metrik', 'nilai'])
-        w.writerow(['total_target_paket', TOTAL_TARGET])
-        w.writerow(['rx_pkt_total', stats['rx_pkt']])
-        w.writerow(['loss_pkt', stats['loss_pkt']])
-        w.writerow(['loss_pct', round(stats['loss_pct'], 2)])
-        w.writerow(['success_ratio_pct', round(stats['success_ratio'], 2)])
-        w.writerow(['throughput_kbps', round(stats['thr_kbps'], 3)])
-        w.writerow(['pkt_rate', round(stats['pkt_rate'], 1)])
-        w.writerow(['snr_abp_db', round(stats['snr_abp_db'], 2)])
-        w.writerow(['snr_ppg_db', round(stats['snr_ppg_db'], 2)])
-        w.writerow(['bytes_rx', stats['bytes_rx']])
-        w.writerow(['hr_abp_terakhir', round(stats['hr_abp'], 1)])
-        w.writerow(['hr_ppg_terakhir', round(stats['hr_ppg'], 1)])
-        w.writerow(['sbp_mmhg', round(stats['sbp'], 1)])
-        w.writerow(['dbp_mmhg', round(stats['dbp'], 1)])
-        w.writerow(['map_mmhg', round(stats['map'], 1)])
-    print(f"  💾 Ringkasan RX tersimpan di: {os.path.abspath(RINGKASAN_FILENAME)}")
-    print("Program RX selesai.")
+    t_rx.join(timeout=IDLE_STOP_S + 5)
+
+    cetak_ringkasan()
+    print('[Main] Selesai.')
+
 
 if __name__ == '__main__':
     main()
