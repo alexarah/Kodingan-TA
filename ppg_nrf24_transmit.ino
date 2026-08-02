@@ -40,7 +40,7 @@ void setup() {
 
   radio.setPALevel(RF24_PA_HIGH);
   radio.setDataRate(RF24_250KBPS);
-  radio.setChannel(100);
+  radio.setChannel(76);
   radio.setPayloadSize(sizeof(PPGPacket));
   radio.openWritingPipe(ADDRESS);
   radio.stopListening();
