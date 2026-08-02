@@ -52,7 +52,7 @@ void setup() {
   // ─── Konfigurasi HARUS sama persis dengan TX ───────────
   radio.setPALevel(RF24_PA_LOW);      // RX bisa LOW
   radio.setDataRate(RF24_250KBPS);
-  radio.setChannel(76);
+  radio.setChannel(0);
   radio.setPayloadSize(sizeof(ABPPacket));
   radio.openReadingPipe(0, ADDRESS);
   radio.startListening();             // mode receiver
