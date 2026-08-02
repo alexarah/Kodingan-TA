@@ -50,7 +50,7 @@ void setup() {
 
   radio.setPALevel(RF24_PA_HIGH);     // HIGH untuk jangkauan WBAN
   radio.setDataRate(RF24_250KBPS);   // paling stabil untuk jarak dekat
-  radio.setChannel(76);             
+  radio.setChannel(0);             
   radio.setPayloadSize(sizeof(ABPPacket));
   radio.openWritingPipe(ADDRESS);
   radio.stopListening();              // mode transmitter
